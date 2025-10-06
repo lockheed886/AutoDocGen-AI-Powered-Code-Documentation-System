@@ -1,0 +1,6 @@
+streamlit==1.29.0
+torch>=1.13.0
+numpy
+pandas
+scikit-learn
+tqdm

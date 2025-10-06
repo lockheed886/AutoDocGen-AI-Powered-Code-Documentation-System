@@ -1,0 +1,2 @@
+# Track model artifacts with Git LFS
+model_artifacts/* filter=lfs diff=lfs merge=lfs -text

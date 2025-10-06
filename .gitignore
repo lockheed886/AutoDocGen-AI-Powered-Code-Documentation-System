@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+env/
+venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# If you ever use external storage, don't ignore model_artifacts (we will track it with LFS)
+# model_artifacts/
