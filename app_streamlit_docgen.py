@@ -65,7 +65,6 @@ def fallback_encode(text, token_to_id, max_len=None, unk_token="<UNK>"):
     return ids
 
 # -------------- Model classes (must match training definitions) --------------
-# Minimal copy of Seq2SeqAttention used during training
 class Seq2SeqAttention(nn.Module):
     def __init__(self, enc_vocab, dec_vocab, emb_dim, hid_dim, emb_enc=None, emb_dec=None, dropout=0.1, num_layers=1, PAD_ENC=0, PAD_DEC=0):
         super().__init__()
@@ -87,9 +86,7 @@ class Seq2SeqAttention(nn.Module):
         dec_h = h_n[-1]
         dec_c = c_n[-1]
         outputs = []
-        Le = enc_out.size(1)
         if dec_input is None:
-            # BOS handling done by caller
             bos_ids = torch.zeros((B,), dtype=torch.long, device=enc_input.device)
             emb_prev = self.dec_emb(bos_ids)
         seq_len = (dec_input.size(1) if dec_input is not None else max_len)
@@ -118,29 +115,22 @@ class Seq2SeqAttention(nn.Module):
 # ---------------------------
 @st.cache_resource(show_spinner=False)
 def load_artifacts():
-    # 1) tokenizers
     code_tok, code_idtok, code_decode, code_encode = load_bpe_info(BPE_CODE_PKL)
     doc_tok, doc_idtok, doc_decode, doc_encode = load_bpe_info(BPE_DOC_PKL)
-    # 2) w2v
     w2v_code = safe_load_pickle(W2V_CODE_PKL)
     w2v_doc  = safe_load_pickle(W2V_DOC_PKL)
-    # 3) dataset index (tokenized_sample.pkl) for context retrieval
     tokenized_df = None
     if os.path.exists(DATA_SAMPLE_PKL):
         try:
             tokenized_df = pd.read_pickle(DATA_SAMPLE_PKL)
         except Exception:
             tokenized_df = None
-    # 4) Model: DO NOT attempt to load full model pickle; build model & load state_dict
     model = None
     model_meta = {}
-    # NOTE: intentionally skip loading FULL_MODEL_PATH to avoid torch unpickling of custom classes
     if model is None and os.path.exists(MODEL_STATE_PATH):
-        # reconstruct architecture using tokenizers sizes
         enc_vocab = (max(code_tok.values())+1) if code_tok else 3000
         dec_vocab = (max(doc_tok.values())+1) if doc_tok else 3000
         emb_enc = None; emb_dec = None
-        # If w2v available, build embedding matrices (best-effort)
         if w2v_code and "W_in" in w2v_code:
             W_in = np.array(w2v_code["W_in"])
             emb_enc = np.random.normal(scale=0.01, size=(enc_vocab, W_in.shape[1])).astype(np.float32)
@@ -157,12 +147,10 @@ def load_artifacts():
             model.to(DEVICE)
             model_meta['loaded_state_dict'] = True
         except Exception as e:
-            # if state_dict load fails, mark and leave model None
             model = None
             model_meta['state_load_error'] = str(e)
     else:
         model_meta['loaded_state_dict'] = False
-    # include a listing of files in BASE_PATH for diagnostics
     try:
         model_meta['base_files'] = os.listdir(BASE_PATH)
     except Exception:
@@ -174,21 +162,17 @@ def load_artifacts():
         "model": model, "model_meta": model_meta, "tokenized_df": tokenized_df
     }
 
-# -------------- Context retrieval helpers using W2V --------------
 def average_w2v_for_tokens(token_ids, w2v):
-    # w2v expected structure: {"W_in": array, "word_to_id": {...}} or similar
     if w2v is None or "W_in" not in w2v: return None
     W = np.array(w2v["W_in"])
     map_word2id = w2v.get("word_to_id") or w2v.get("id_to_word") or {}
     vecs = []
     for t in token_ids:
-        # try several lookups
         if isinstance(map_word2id, dict) and t in map_word2id:
             idx = map_word2id[t]
             if 0 <= int(idx) < W.shape[0]:
                 vecs.append(W[int(idx)])
         else:
-            # fallback: if token is int and maps directly:
             try:
                 if isinstance(t, int) and t < W.shape[0]:
                     vecs.append(W[int(t)])
@@ -200,20 +184,15 @@ def average_w2v_for_tokens(token_ids, w2v):
 
 def retrieve_similar_examples(avg_vec, tokenized_df, w2v, top_k=3):
     if avg_vec is None or tokenized_df is None or w2v is None: return []
-    # precompute sample embeddings (cacheable in production)
     sample_embs = []
     for i, row in tokenized_df.iterrows():
         code_ids = row.get("code_token_ids") or row.get("code_tokens") or []
         emb = average_w2v_for_tokens(code_ids, w2v)
-        if emb is None:
-            sample_embs.append(None)
-        else:
-            sample_embs.append(emb)
+        sample_embs.append(emb)
     sample_embs_arr = np.array([e for e in sample_embs if e is not None])
     if sample_embs_arr.size == 0: return []
-    # compute cosine similarities — this is simplified; in practice you'd pre-index
     sims = []
-    for i,e in enumerate(sample_embs):
+    for e in sample_embs:
         if e is None: sims.append(-1.0)
         else:
             sims.append(float(np.dot(avg_vec, e) / (np.linalg.norm(avg_vec) * (np.linalg.norm(e) + 1e-9) + 1e-9)))
@@ -230,7 +209,6 @@ def retrieve_similar_examples(avg_vec, tokenized_df, w2v, top_k=3):
         })
     return results
 
-# -------------- Generation functions -------------------------------
 def encode_input_text(text, artifacts, max_len=256):
     code_tok = artifacts["code_tok"]
     code_encode = artifacts["code_encode"]
@@ -240,22 +218,16 @@ def encode_input_text(text, artifacts, max_len=256):
             return ids[:max_len]
         except Exception:
             pass
-    # fallback: whitespace -> token ids
     return fallback_encode(text, code_tok, max_len=max_len)
 
-# removed @st.cache_data decorator to avoid UnhashableParamError from Streamlit caching
 def greedy_seq2seq_generate_local(model, enc_ids, artifacts, max_len=256):
     model.eval()
     code_decode = artifacts["code_decode"]
     doc_decode = artifacts["doc_decode"]
-    PAD_DEC = artifacts["doc_tok"].get("<PAD>", 0) if artifacts["doc_tok"] else 0
-    BOS_DEC = artifacts["doc_tok"].get("<BOS>", None) if artifacts["doc_tok"] else None
     enc = torch.tensor([enc_ids], dtype=torch.long, device=DEVICE)
     with torch.no_grad():
-        # if model is Seq2SeqAttention we can call .forward with dec_input=None
         logits = model(enc, dec_input=None, max_len=max_len)  # (1,L,V)
         ids = torch.argmax(logits, dim=2).cpu().numpy().tolist()[0]
-    # trim at EOS if present
     EOS = artifacts["doc_tok"].get("<EOS>") if artifacts["doc_tok"] else None
     if EOS is not None:
         if EOS in ids:
@@ -265,69 +237,106 @@ def greedy_seq2seq_generate_local(model, enc_ids, artifacts, max_len=256):
     else:
         return " ".join(map(str, ids))
 
-# -------------- Streamlit UI (aesthetic layout, no functionality change) ---------------------------
-def main():
-    st.set_page_config(page_title="DocGen - Integrated System", layout="wide")
-    # tiny CSS to reduce vertical spacing a bit for a denser layout
-    st.markdown(
-        """
+# -------------- UI Design CSS Variables --------------
+def inject_custom_css():
+    st.markdown("""
         <style>
-          .stButton>button { padding: .375rem .75rem; }
-          .css-1d391kg {padding-top: .5rem;} /* smaller top padding for header area */
-          .block-container { padding-top: 1rem; padding-left: 1rem; padding-right: 1rem; }
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap');
+        
+        /* Base Styling */
+        html, body, [class*="css"]  {
+            font-family: 'Inter', sans-serif !important;
+        }
+
+        /* Headers */
+        h1 {
+            background: -webkit-linear-gradient(45deg, #38bdf8, #818cf8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 800 !important;
+            font-size: 3rem !important;
+            letter-spacing: -1px;
+            margin-bottom: 0.5rem;
+            text-align: center;
+        }
+
+        /* Glassmorphism Containers */
+        .glass-container {
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 1rem;
+            padding: 2rem;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.2);
+            margin-bottom: 2rem;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        .glass-container:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 40px rgba(0, 0, 0, 0.4);
+        }
+
+        /* Buttons */
+        .stButton>button {
+            width: 100%;
+            background: linear-gradient(90deg, #38bdf8 0%, #818cf8 100%);
+            color: white !important;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            font-weight: 600;
+            border-radius: 9999px; /* full rounded */
+            box-shadow: 0 4px 14px 0 rgba(129, 140, 248, 0.39);
+            transition: all 0.3s ease;
+        }
+        .stButton>button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(129, 140, 248, 0.5);
+            background: linear-gradient(90deg, #60a5fa 0%, #a78bfa 100%);
+        }
         </style>
-        """,
-        unsafe_allow_html=True,
-    )
+        """, unsafe_allow_html=True)
 
-    st.title("Integrated Documentation Generation System (BPE + Word2Vec + Seq2Seq)")
+# -------------- Main UI Function --------------
+def main():
+    st.set_page_config(page_title="AutoDocGen AI", layout="wide")
+    inject_custom_css()
 
-    # --- Sidebar: generation options (keeps main page compact) ---
+    st.markdown("<h1>✨ AutoDocGen AI</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #94a3b8; font-size: 1.1rem; margin-bottom: 2rem;'>Automated Code Documentation using BPE, Word2Vec, and Seq2Seq with Self-Attention</p>", unsafe_allow_html=True)
+
     with st.sidebar:
-        st.header("Generation options")
-        gen_type = st.selectbox("What to generate", ["Short summary", "Full docstring"])
-        max_len = st.slider("Max generated length (tokens)", min_value=30, max_value=400, value=128)
-        # Beam search removed — always use Greedy
-        use_context = st.checkbox("Use context retrieval (Word2Vec)", value=True)
-        top_k_context = st.slider("Nearest neighbors", 1, 5, 2)
+        st.markdown("<h3 style='color: white;'>⚙️ Generation Settings</h3>", unsafe_allow_html=True)
+        gen_type = st.selectbox("Documentation Type", ["Short Summary", "Full Docstring"])
+        max_len = st.slider("Max Length (tokens)", min_value=30, max_value=400, value=128)
+        use_context = st.checkbox("Enable Context Retrieval (Word2Vec)", value=True)
+        top_k_context = st.slider("Nearest Neighbors", 1, 5, 2)
         st.markdown("---")
+        st.markdown("<p style='font-size: 0.8rem; color: #64748b; text-align: center;'>Powered by Streamlit</p>", unsafe_allow_html=True)
 
-    # load artifacts
-    with st.spinner("Loading models & tokenizers..."):
+    with st.spinner("Loading AI Models & Context Spaces..."):
         artifacts = load_artifacts()
+    
     model = artifacts.get("model")
-    # If model failed to load, show diagnostic info (helps debug on Streamlit Cloud)
     if model is None:
-        st.error("Model not found or failed to load. Check MODEL_STATE_PATH or FULL_MODEL_PATH.")
-        meta = artifacts.get("model_meta", {})
-        if meta:
-            st.write("model_meta:", {k: v for k, v in meta.items() if k != 'state_load_error'})
-            if meta.get("state_load_error"):
-                st.write("State load error:", meta.get("state_load_error"))
-        try:
-            files = os.listdir(BASE_PATH)
-            st.write("Files in", BASE_PATH, ":", files)
-        except Exception as e:
-            st.write("Could not list BASE_PATH:", str(e))
-        return
+        st.error("⚠️ AI Models not found or failed to load. Check model artifacts paths.")
+        st.stop()
 
-    # Main layout: left = input, right = output & context (compact)
-    left, right = st.columns([2, 1])
+    left_col, right_col = st.columns([1.2, 1])
 
-    # LEFT: input & controls
-    with left:
-        st.subheader("Input function")
-        code_input = st.text_area("Paste function code (or upload .py)", height=200, key="code_input")
-        uploaded = st.file_uploader("Upload a .py file (optional)", type=["py"])
-        if uploaded and not code_input:
-            try:
-                raw = uploaded.read().decode("utf8")
-                code_input = raw
-                st.session_state["code_input"] = raw
-            except Exception:
-                pass
+    # Variables for snippet tracking
+    func_choice = None
+    code_input = ""
 
-        # Try to auto-extract functions
+    with left_col:
+        st.markdown("<div class='glass-container'>", unsafe_allow_html=True)
+        st.markdown("### 💻 Source Code", unsafe_allow_html=True)
+        
+        uploaded = st.file_uploader("Upload Python File (.py)", type=["py"])
+        
+        if uploaded:
+            code_input = uploaded.read().decode("utf8")
+        else:
+            code_input = st.text_area("Or copy and paste your function code below:", height=250, placeholder="def calculate_total_amount(cart):\n    return sum(item.price for item in cart)")
+
+        # Auto-extract logic
         funcs = []
         if code_input:
             try:
@@ -337,98 +346,65 @@ def main():
                         src = ast.get_source_segment(code_input, node) or ast.unparse(node)
                         funcs.append((node.name, src))
             except Exception:
-                funcs = []
+                pass
 
-        func_choice = None
         if funcs:
             names = [f[0] for f in funcs]
-            idx = st.selectbox("Select function (extracted)", range(len(names)), format_func=lambda i: names[i])
+            idx = st.selectbox("Select function to analyze:", range(len(names)), format_func=lambda i: names[i])
             func_choice = funcs[idx][1]
             st.code(func_choice, language="python")
-        else:
-            st.info("No function automatically extracted — paste a single function or upload a .py file.")
 
-        # Generate button (keeps everything above fold)
-        gen_col1, gen_col2 = st.columns([1, 1])
-        with gen_col1:
-            generate_btn = st.button("Generate documentation")
-        with gen_col2:
-            clear_btn = st.button("Clear input")
+        col1, col2 = st.columns(2)
+        with col1:
+            generate_btn = st.button("🚀 Generate Docstring")
+        with col2:
+            clear_btn = st.button("🗑️ Clear Input")
             if clear_btn:
-                st.session_state["code_input"] = ""
-                code_input = ""
+                st.query_params.clear()
 
-    # RIGHT: output + context (collapsed sections)
-    with right:
-        out_placeholder = st.empty()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        # show a small header & download area (will be populated on generation)
-        out_placeholder.info("Generated documentation will appear here.")
+    with right_col:
+        st.markdown("<div class='glass-container'>", unsafe_allow_html=True)
+        st.markdown("### 📄 Generated Output", unsafe_allow_html=True)
+        
+        output_placeholder = st.empty()
+        
+        if generate_btn:
+            snippet = func_choice or code_input
+            if not snippet.strip():
+                st.warning("Please provide some code to generate documentation for.")
+            else:
+                with st.spinner("Synthesizing documentation..."):
+                    enc_ids = encode_input_text(snippet, artifacts, max_len=256)
+                    context_docstrings = []
+                    
+                    if use_context and artifacts.get("w2v_code") is not None and artifacts.get("tokenized_df") is not None:
+                        avg_vec = average_w2v_for_tokens(enc_ids, artifacts["w2v_code"])
+                        sims = retrieve_similar_examples(avg_vec, artifacts["tokenized_df"], artifacts["w2v_code"], top_k=top_k_context)
+                        for s in sims:
+                            context_docstrings.append(s.get("docstring") or s.get("summary") or "")
 
-        with st.expander("Context / nearest neighbors", expanded=False):
-            st.write("Nearest neighbor docstrings (if context retrieval is enabled):")
-            st.write("(Will populate after generation)")
+                    context_concat = "\n\n".join([snippet] + context_docstrings) if context_docstrings else snippet
+                    enc_ids_final = encode_input_text(context_concat, artifacts, max_len=400)
 
-        with st.expander("Quick diagnostics", expanded=False):
-            meta = artifacts.get("model_meta", {})
-            st.write("Files in model_artifacts:", meta.get("base_files"))
-            st.write("State dict loaded:", meta.get("loaded_state_dict", False))
+                    t0 = time.time()
+                    out_text = greedy_seq2seq_generate_local(model, enc_ids_final, artifacts, max_len=max_len)
+                    t1 = time.time()
 
-    # Handle generation when button clicked
-    if generate_btn:
-        snippet = func_choice or code_input
-        if not snippet:
-            st.error("No code provided.")
+                    st.success(f"Generation completed in {t1-t0:.2f} seconds!")
+                    st.code(out_text, language="python")
+                    st.download_button("📥 Download Result", out_text, file_name="generated_docstring.txt", mime="text/plain")
+                    
+                    if context_docstrings:
+                        with st.expander("🔍 Show Context Used (Semantic Neighbors)"):
+                            for idx, c in enumerate(context_docstrings):
+                                st.markdown(f"**Neighbor {idx+1}:**")
+                                st.code(c, language="python")
         else:
-            # Encode
-            enc_ids = encode_input_text(snippet, artifacts, max_len=256)
-
-            # Context retrieval
-            context_docstrings = []
-            if use_context and artifacts.get("w2v_code") is not None and artifacts.get("tokenized_df") is not None:
-                avg_vec = average_w2v_for_tokens(enc_ids, artifacts["w2v_code"])
-                sims = retrieve_similar_examples(avg_vec, artifacts["tokenized_df"], artifacts["w2v_code"], top_k=top_k_context)
-                for s in sims:
-                    context_docstrings.append(s.get("docstring") or s.get("summary") or "")
-
-            context_concat = "\n\n".join([snippet] + context_docstrings) if context_docstrings else snippet
-            enc_ids_final = encode_input_text(context_concat, artifacts, max_len=400)
-
-            # Run generation (always Greedy now)
-            st.info("Running generation on model (this may take a few seconds)...")
-            t0 = time.time()
-            out_text = greedy_seq2seq_generate_local(model, enc_ids_final, artifacts, max_len=max_len)
-            t1 = time.time()
-
-            # Update right column with results (compact)
-            with right:
-                st.subheader("Generated Documentation")
-                st.code(out_text, language=None)
-                dl_col1, dl_col2 = st.columns([1, 3])
-                with dl_col1:
-                    st.download_button("Download .txt", out_text, file_name="generated_docstring.txt")
-                with dl_col2:
-                    st.success(f"Generated in {t1-t0:.2f}s")
-
-                if context_docstrings:
-                    with st.expander("Context used (nearest neighbors)", expanded=False):
-                        for c in context_docstrings:
-                            st.write(c)
-
-    # Validation examples hidden by default to save space
-    st.markdown("---")
-    with st.expander("Show validation examples (generate for samples)", expanded=False):
-        if artifacts.get("tokenized_df") is None:
-            st.info("No tokenized_sample found in DATA_SAMPLE_PKL.")
-        else:
-            sample_df = artifacts["tokenized_df"].sample(min(6, len(artifacts["tokenized_df"])))
-            for i, r in sample_df.iterrows():
-                st.markdown(f"**Function:** {r.get('func_name', 'unknown')}")
-                st.code(r.get("code", "")[:400], language="python")
-                if st.button(f"Generate for sample {i}", key=f"gen_{i}"):
-                    enc_ids = r.get("code_token_ids") or r.get("code_tokens") or encode_input_text(r.get("code",""), artifacts)
-                    out_text = greedy_seq2seq_generate_local(model, enc_ids, artifacts)
-                    st.code(out_text)
+            st.info("Awaiting input... Provide your code on the left and hit 'Generate Docstring'.")
+        
+        st.markdown("</div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
